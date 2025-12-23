@@ -52,6 +52,3 @@ Open the app here:
 - Some mobile browsers (especially iPhone Safari) may not reliably handle multi-GB downloads due to browser/OS storage limitations.
 
 ---
-
-## Repository Structure
-
