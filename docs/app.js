@@ -3,7 +3,7 @@
    ================================ */
 // After deploying backend on Render, set it like:
 // const SIGNALING_HTTP = "https://p2p-drop-signal.onrender.com";
-const SIGNALING_HTTP = "https://YOUR-BACKEND-ON-RENDER.onrender.com";
+const SIGNALING_HTTP = "https://p2p-drop-signal.onrender.com";
 
 /* ================================
    UI helpers
