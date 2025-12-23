@@ -1,10 +1,7 @@
 /* ================================
-   CONFIG (CHANGE THIS ONE LINE)
+   CONFIG
    ================================ */
-// After deploying backend on Render, set it like:
-// const SIGNALING_HTTP = "https://p2p-drop-signal.onrender.com";
 const SIGNALING_HTTP = "https://p2p-drop-signal.onrender.com";
-
 
 /* ================================
    UI helpers
@@ -30,29 +27,200 @@ function log(msg) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function httpToWsBase(httpUrl) {
+  return httpUrl.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+}
+
 /* ================================
-   WebRTC + Signaling
+   PERFORMANCE TUNING
+   ================================ */
+const NUM_CHANNELS = 4;                  // parallel lanes
+const CHUNK_SIZE = 256 * 1024;           // 256KB chunks
+const HIGH_WATER = 16 * 1024 * 1024;     // 16MB buffer cap per channel
+const LOW_WATER  = 4 * 1024 * 1024;      // resume when < 4MB
+
+/* ================================
+   WebRTC + Signaling state
    ================================ */
 let ws = null;
 let pc = null;
-let dc = null;
+let dcs = []; // RTCDataChannel array
 
-const CHUNK_SIZE = 64 * 1024;           // 64KiB recommended for DataChannel
-const HIGH_WATER = 8 * 1024 * 1024;     // 8MB max buffered before pausing send
-const LOW_WATER  = 2 * 1024 * 1024;     // resume when buffered < 2MB
-
-// RX state
+/* ================================
+   RX state (supports out-of-order)
+   ================================ */
 let rxMeta = null;
-let rxParts = [];
-let rxBytes = 0;
+let rxTotalChunks = 0;
+let rxExpectedSize = 0;
 
-// Used for backpressure waiting
-function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+let rxReceivedBytes = 0;
+let rxNextWriteIndex = 0;
+let rxChunkMap = new Map(); // chunkIndex -> ArrayBuffer payload
 
-function httpToWsBase(httpUrl) {
-  // https://x -> wss://x , http://x -> ws://x
-  return httpUrl.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
+let rxWriter = null;        // FileSystemWritableFileStream (Chrome/Edge)
+let rxWriteChain = Promise.resolve();
+let rxParts = [];           // fallback memory buffer (not good for 6GB)
+
+/* ================================
+   Packet format (binary)
+   [u32 chunkIndex][u32 payloadLen][payload bytes...]
+   ================================ */
+function packChunk(index, payloadBuf) {
+  const payloadLen = payloadBuf.byteLength;
+  const out = new ArrayBuffer(8 + payloadLen);
+  const dv = new DataView(out);
+  dv.setUint32(0, index);
+  dv.setUint32(4, payloadLen);
+  new Uint8Array(out, 8).set(new Uint8Array(payloadBuf));
+  return out;
 }
+
+function unpackChunk(packetBuf) {
+  const dv = new DataView(packetBuf);
+  const index = dv.getUint32(0);
+  const len = dv.getUint32(4);
+  const payload = packetBuf.slice(8, 8 + len);
+  return { index, payload };
+}
+
+/* ================================
+   Streaming save (desktop Chrome/Edge)
+   ================================ */
+async function openWriterIfPossible(fileName) {
+  // Only works on desktop Chrome/Edge; not on iPhone Safari.
+  if (!window.showSaveFilePicker) return null;
+
+  const handle = await window.showSaveFilePicker({
+    suggestedName: fileName,
+    types: [{ description: "All files", accept: { "*/*": [".*"] } }],
+  });
+  return await handle.createWritable();
+}
+
+async function drainWrites() {
+  while (rxChunkMap.has(rxNextWriteIndex)) {
+    const payload = rxChunkMap.get(rxNextWriteIndex);
+    rxChunkMap.delete(rxNextWriteIndex);
+
+    if (rxWriter) {
+      await rxWriter.write(payload);
+    } else {
+      // fallback memory buffer (may crash for huge files)
+      rxParts.push(payload);
+    }
+    rxNextWriteIndex++;
+  }
+
+  // done?
+  if (rxMeta && rxNextWriteIndex === rxTotalChunks) {
+    if (rxWriter) {
+      await rxWriter.close();
+      log("[RX] File saved (streamed to disk).");
+    } else {
+      // Big files may crash here; desktop only.
+      const blob = new Blob(rxParts, { type: rxMeta.mime || "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = rxMeta.name || "download";
+      a.click();
+      URL.revokeObjectURL(url);
+      log("[RX] Download triggered (buffered).");
+      rxParts = [];
+    }
+
+    // reset
+    rxMeta = null;
+    rxTotalChunks = 0;
+    rxExpectedSize = 0;
+    rxReceivedBytes = 0;
+    rxNextWriteIndex = 0;
+    rxChunkMap.clear();
+    progressEl.value = 0;
+  }
+}
+
+function handleIncoming(data) {
+  if (typeof data === "string") {
+    const msg = JSON.parse(data);
+
+    if (msg.kind === "meta") {
+      rxMeta = msg;
+      rxTotalChunks = msg.totalChunks;
+      rxExpectedSize = msg.size;
+
+      rxReceivedBytes = 0;
+      rxNextWriteIndex = 0;
+      rxChunkMap.clear();
+      rxParts = [];
+      progressEl.value = 0;
+
+      log(`[RX] Incoming: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks)`);
+
+      // prepare streaming writer
+      rxWriter = null;
+      rxWriteChain = (async () => {
+        try {
+          rxWriter = await openWriterIfPossible(msg.name);
+          if (rxWriter) log("[RX] Streaming write enabled (best for multi-GB).");
+          else log("[RX] Streaming not available (will buffer in memory).");
+        } catch {
+          rxWriter = null;
+          log("[RX] Save picker canceled; will buffer in memory.");
+        }
+      })();
+    }
+    return;
+  }
+
+  // binary packet
+  const { index, payload } = unpackChunk(data);
+
+  rxChunkMap.set(index, payload);
+  rxReceivedBytes += payload.byteLength;
+
+  if (rxExpectedSize > 0) {
+    progressEl.value = Math.min(100, Math.floor((rxReceivedBytes / rxExpectedSize) * 100));
+  }
+
+  rxWriteChain = rxWriteChain.then(() => drainWrites()).catch(() => {});
+}
+
+/* ================================
+   Connection lifecycle
+   ================================ */
+function cleanup() {
+  connectBtn.disabled = false;
+  disconnectBtn.disabled = true;
+  sendBtn.disabled = true;
+
+  try { if (ws) ws.close(); } catch {}
+  try { if (dcs) dcs.forEach(c => c && c.close()); } catch {}
+  try { if (pc) pc.close(); } catch {}
+
+  ws = null;
+  pc = null;
+  dcs = [];
+
+  // RX reset
+  rxMeta = null;
+  rxTotalChunks = 0;
+  rxExpectedSize = 0;
+  rxReceivedBytes = 0;
+  rxNextWriteIndex = 0;
+  rxChunkMap.clear();
+  rxWriter = null;
+  rxParts = [];
+  progressEl.value = 0;
+
+  setStatus("Disconnected", false);
+}
+
+disconnectBtn.onclick = () => cleanup();
 
 randBtn.onclick = () => {
   roomEl.value = Math.floor(1000 + Math.random() * 9000).toString();
@@ -61,10 +229,6 @@ randBtn.onclick = () => {
 connectBtn.onclick = async () => {
   const roomId = roomEl.value.trim();
   if (!roomId) return alert("Enter a Room ID first.");
-
-  if (!SIGNALING_HTTP.includes("http")) {
-    return alert("Set SIGNALING_HTTP in app.js to your Render backend URL.");
-  }
 
   const wsBase = httpToWsBase(SIGNALING_HTTP);
   const wsUrl = `${wsBase}/ws/${encodeURIComponent(roomId)}`;
@@ -84,7 +248,6 @@ connectBtn.onclick = async () => {
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
-
     if (!pc) return;
 
     if (msg.type === "offer") {
@@ -111,41 +274,20 @@ connectBtn.onclick = async () => {
   };
 
   ws.onclose = () => {
-    setStatus("Disconnected", false);
     log("[WS] closed");
     cleanup();
   };
 };
 
-disconnectBtn.onclick = () => {
-  if (ws) ws.close();
-  cleanup();
-};
-
-function cleanup() {
-  connectBtn.disabled = false;
-  disconnectBtn.disabled = true;
-  sendBtn.disabled = true;
-
-  if (dc) { try { dc.close(); } catch {} }
-  if (pc) { try { pc.close(); } catch {} }
-  dc = null;
-  pc = null;
-
-  ws = null;
-
-  rxMeta = null;
-  rxParts = [];
-  rxBytes = 0;
-  progressEl.value = 0;
-}
-
+/* ================================
+   WebRTC setup
+   ================================ */
 async function startPeer() {
-  // TURN not included here. Add TURN later for “works everywhere”.
   pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" }
-    ]
+      // Add TURN here later for “works everywhere”
+    ],
   });
 
   pc.onicecandidate = (e) => {
@@ -157,18 +299,25 @@ async function startPeer() {
   pc.onconnectionstatechange = () => {
     log(`[RTC] state=${pc.connectionState}`);
     if (pc.connectionState === "connected") setStatus("P2P connected", true);
-    if (["failed","disconnected","closed"].includes(pc.connectionState)) setStatus("P2P not connected", false);
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) setStatus("P2P not connected", false);
   };
 
-  // If remote creates channel, receive it here
+  // Remote-created channels
   pc.ondatachannel = (e) => {
-    dc = e.channel;
-    setupDataChannel();
+    const ch = e.channel;
+    const m = /file-(\d+)/.exec(ch.label || "");
+    const idx = m ? parseInt(m[1], 10) : 0;
+    setupDataChannel(ch, idx);
+    dcs[idx] = ch;
   };
 
-  // Create our own channel too (works fine; one will become the active one)
-  dc = pc.createDataChannel("file", { ordered: true });
-  setupDataChannel();
+  // Create multiple channels
+  dcs = [];
+  for (let i = 0; i < NUM_CHANNELS; i++) {
+    const ch = pc.createDataChannel(`file-${i}`, { ordered: false });
+    setupDataChannel(ch, i);
+    dcs.push(ch);
+  }
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
@@ -177,104 +326,92 @@ async function startPeer() {
   log("[SIG] offer sent");
 }
 
-function setupDataChannel() {
-  dc.binaryType = "arraybuffer";
-  dc.bufferedAmountLowThreshold = LOW_WATER;
+function setupDataChannel(ch, idx) {
+  ch.binaryType = "arraybuffer";
+  ch.bufferedAmountLowThreshold = LOW_WATER;
 
-  dc.onopen = () => {
-    log("[DC] open");
-    sendBtn.disabled = false;
-    setStatus("P2P connected", true);
+  ch.onopen = () => {
+    log(`[DC${idx}] open`);
+    // enable send only when ALL channels open
+    const allOpen =
+      dcs.length === NUM_CHANNELS &&
+      dcs.every((c) => c && c.readyState === "open");
+
+    if (allOpen) {
+      sendBtn.disabled = false;
+      setStatus("P2P connected", true);
+    }
   };
 
-  dc.onclose = () => {
-    log("[DC] closed");
+  ch.onclose = () => {
+    log(`[DC${idx}] closed`);
     sendBtn.disabled = true;
   };
 
-  dc.onerror = () => {
-    log("[DC] error");
+  ch.onerror = () => {
+    log(`[DC${idx}] error`);
     sendBtn.disabled = true;
   };
 
-  dc.onmessage = (event) => {
-    // First message is JSON meta; then binary chunks
-    if (typeof event.data === "string") {
-      const msg = JSON.parse(event.data);
-      if (msg.kind === "meta") {
-        rxMeta = msg;
-        rxParts = [];
-        rxBytes = 0;
-        progressEl.value = 0;
-        log(`[RX] Incoming: ${rxMeta.name} (${rxMeta.size} bytes)`);
-      }
-      return;
-    }
-
-    // Binary chunk
-    const buf = event.data;
-    rxParts.push(buf);
-    rxBytes += buf.byteLength;
-
-    if (rxMeta && rxMeta.size > 0) {
-      progressEl.value = Math.min(100, Math.floor((rxBytes / rxMeta.size) * 100));
-    }
-
-    // Finished?
-    if (rxMeta && rxBytes >= rxMeta.size) {
-      const blob = new Blob(rxParts, { type: rxMeta.mime || "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = rxMeta.name || "download";
-      a.click();
-
-      URL.revokeObjectURL(url);
-      log("[RX] Download ready");
-      rxMeta = null;
-      rxParts = [];
-      rxBytes = 0;
-      progressEl.value = 0;
-    }
-  };
+  ch.onmessage = (event) => handleIncoming(event.data);
 }
 
+/* ================================
+   Sending (parallel / round-robin)
+   ================================ */
 sendBtn.onclick = async () => {
   const file = fileEl.files[0];
   if (!file) return alert("Select a file first.");
-  if (!dc || dc.readyState !== "open") return alert("Not connected yet.");
 
-  // send meta first
-  const meta = { kind: "meta", name: file.name, size: file.size, mime: file.type };
-  dc.send(JSON.stringify(meta));
-  log(`[TX] Sending: ${file.name} (${file.size} bytes)`);
+  const ready =
+    dcs.length === NUM_CHANNELS &&
+    dcs.every((c) => c && c.readyState === "open");
 
+  if (!ready) return alert("Not connected yet (all channels not open).");
+
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+  // send meta on channel 0
+  const meta = {
+    kind: "meta",
+    name: file.name,
+    size: file.size,
+    mime: file.type,
+    chunkSize: CHUNK_SIZE,
+    totalChunks
+  };
+  dcs[0].send(JSON.stringify(meta));
+
+  log(`[TX] Sending: ${file.name} (${file.size} bytes, ${totalChunks} chunks, ${NUM_CHANNELS} channels)`);
   progressEl.value = 0;
 
-  let offset = 0;
+  let sentBytes = 0;
 
-  while (offset < file.size) {
-    // Backpressure: if buffered too much, wait until low threshold event
-    while (dc.bufferedAmount > HIGH_WATER) {
-      await new Promise(resolve => {
+  for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+    const offset = chunkIndex * CHUNK_SIZE;
+    const slice = file.slice(offset, offset + CHUNK_SIZE);
+    const buf = await slice.arrayBuffer();
+
+    const chIdx = chunkIndex % NUM_CHANNELS;
+    const ch = dcs[chIdx];
+
+    // per-channel backpressure
+    while (ch.bufferedAmount > HIGH_WATER) {
+      await new Promise((resolve) => {
         const onLow = () => {
-          dc.removeEventListener("bufferedamountlow", onLow);
+          ch.removeEventListener("bufferedamountlow", onLow);
           resolve();
         };
-        dc.addEventListener("bufferedamountlow", onLow);
+        ch.addEventListener("bufferedamountlow", onLow);
       });
     }
 
-    const slice = file.slice(offset, offset + CHUNK_SIZE);
-    const buf = await slice.arrayBuffer();
-    dc.send(buf);
+    ch.send(packChunk(chunkIndex, buf));
 
-    offset += buf.byteLength;
-    progressEl.value = Math.min(100, Math.floor((offset / file.size) * 100));
+    sentBytes += buf.byteLength;
+    progressEl.value = Math.min(100, Math.floor((sentBytes / file.size) * 100));
   }
 
   log("[TX] Done");
-  // keep progress for a moment
-  await wait(300);
+  await wait(200);
 };
