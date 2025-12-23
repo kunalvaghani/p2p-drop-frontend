@@ -1,6 +1,7 @@
 /* ================================
    CONFIG
    ================================ */
+// URL of your signalling server on Render. Do not include the WebSocket protocol here.
 const SIGNALING_HTTP = "https://p2p-drop-signal.onrender.com";
 
 /* ================================
@@ -38,50 +39,55 @@ function isMobile() {
   return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
 
-// IMPORTANT: mobile browsers cannot safely buffer multi-GB
+// Mobile browsers cannot buffer multi‑GB files; reject when larger than this.
 const MAX_MOBILE_BYTES = 500 * 1024 * 1024; // 500MB
 
 /* ================================
    PERFORMANCE TUNING
    ================================ */
+// Number of parallel WebRTC DataChannels for sending chunks. Increase or decrease
+// based on your network; 4 is a good balance for most broadband connections.
 const NUM_CHANNELS = 4;
-const CHUNK_SIZE = 256 * 1024;           // 256KB
-const HIGH_WATER = 16 * 1024 * 1024;     // 16MB buffered cap per channel
-const LOW_WATER  = 4 * 1024 * 1024;      // resume when < 4MB
+// Size of each file chunk sent over the data channel. Larger chunks reduce overhead
+// but may increase buffering on slow networks. 256 KiB is a good compromise.
+const CHUNK_SIZE = 256 * 1024;
+// When a channel has more than HIGH_WATER bytes buffered, pause sending on it.
+const HIGH_WATER = 16 * 1024 * 1024;
+// Resume sending when buffered bytes drop below LOW_WATER.
+const LOW_WATER  = 4 * 1024 * 1024;
 
 /* ================================
    WebRTC + Signaling state
    ================================ */
-let ws = null;
-let pc = null;
-let dcs = []; // RTCDataChannel array
+let ws = null;          // WebSocket connection to signalling server
+let pc = null;          // RTCPeerConnection
+let dcs = [];           // Array of DataChannels
 
 /* ================================
-   TX state (wait accept / reject)
+   TX state (sender) variables
    ================================ */
-let txActive = false;
-let txAbort = false;
-let txWaitAcceptResolve = null;
+let txActive = false;         // True while a transfer is underway
+let txAbort = false;          // True if transfer should abort
+let txWaitAcceptResolve = null; // Resolver for waiting on receiver accept
 
 /* ================================
-   RX state (accept flow)
+   RX state (receiver) variables
    ================================ */
-let pendingMeta = null;
-
-let rxMeta = null;
+let pendingMeta = null;       // Metadata awaiting acceptance
+let rxMeta = null;            // Metadata of file being received
 let rxTotalChunks = 0;
 let rxExpectedSize = 0;
 let rxReceivedBytes = 0;
 let rxNextWriteIndex = 0;
-let rxChunkMap = new Map(); // chunkIndex -> ArrayBuffer payload
-let rxWriter = null;        // FileSystemWritableFileStream (Chrome/Edge)
-let rxWriteChain = Promise.resolve();
-let rxParts = [];           // fallback memory buffer (not good for huge files)
+let rxChunkMap = new Map();   // Map from chunk index to ArrayBuffer
+let rxWriter = null;          // FileSystemWritableFileStream for streaming save
+let rxWriteChain = Promise.resolve(); // Chain to serialize writes
+let rxParts = [];             // Fallback buffer for browsers without streaming
 
 /* ================================
    Packet format (binary)
-   [u32 chunkIndex][u32 payloadLen][payload bytes...]
    ================================ */
+// Pack a payload with chunk index and length header (two 32-bit integers).
 function packChunk(index, payloadBuf) {
   const payloadLen = payloadBuf.byteLength;
   const out = new ArrayBuffer(8 + payloadLen);
@@ -92,6 +98,7 @@ function packChunk(index, payloadBuf) {
   return out;
 }
 
+// Extract chunk index and payload from a packet.
 function unpackChunk(packetBuf) {
   const dv = new DataView(packetBuf);
   const index = dv.getUint32(0);
@@ -111,12 +118,11 @@ function sendControl(msgObj) {
 }
 
 /* ================================
-   Streaming save (desktop Chrome/Edge)
+   Streaming save (desktop only)
    ================================ */
 async function openWriterIfPossible(fileName) {
-  // Mobile Safari doesn't support this.
+  // Only available in Chrome/Edge on desktop.
   if (!window.showSaveFilePicker) return null;
-
   const handle = await window.showSaveFilePicker({
     suggestedName: fileName,
     types: [{ description: "All files", accept: { "*/*": [".*"] } }],
@@ -141,23 +147,19 @@ async function drainWrites() {
   while (rxChunkMap.has(rxNextWriteIndex)) {
     const payload = rxChunkMap.get(rxNextWriteIndex);
     rxChunkMap.delete(rxNextWriteIndex);
-
     if (rxWriter) {
       await rxWriter.write(payload);
     } else {
       rxParts.push(payload);
     }
-
     rxNextWriteIndex++;
   }
-
-  // Done?
+  // Once all chunks have been written, finalize download.
   if (rxMeta && rxNextWriteIndex === rxTotalChunks) {
     if (rxWriter) {
       await rxWriter.close();
       log("[RX] File saved (streamed to disk).");
     } else {
-      // WARNING: huge files may crash in browsers that must buffer in RAM.
       const blob = new Blob(rxParts, { type: rxMeta.mime || "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -165,23 +167,21 @@ async function drainWrites() {
       a.download = rxMeta.name || "download";
       a.click();
       URL.revokeObjectURL(url);
-      log("[RX] Download triggered (buffered).");
+      log("[RX] Download triggered (buffered). Large files may fail if memory is insufficient.");
     }
-
     resetRxHard();
   }
 }
 
 /* ================================
-   Incoming handler
+   Incoming message handler
    ================================ */
 function handleIncoming(data) {
-  // STRING = control/meta
+  // If the data is a string, treat it as JSON control or meta.
   if (typeof data === "string") {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
-
-    // Sender-side: receiver rejected
+    // Sender: handle reject from receiver.
     if (msg.kind === "reject") {
       if (txActive) {
         txAbort = true;
@@ -191,61 +191,49 @@ function handleIncoming(data) {
       }
       return;
     }
-
-    // Sender-side: receiver accepted (start transfer)
+    // Sender: handle accept from receiver.
     if (msg.kind === "accept") {
       if (txWaitAcceptResolve) { txWaitAcceptResolve(); txWaitAcceptResolve = null; }
       log("[TX] Receiver accepted. Starting transfer...");
       return;
     }
-
-    // Receiver-side: meta (do NOT open picker here; wait for Accept button)
+    // Receiver: handle metadata message.
     if (msg.kind === "meta") {
       resetRxHard();
       pendingMeta = msg;
-
-      // Mobile guard: reject early
+      // On mobile, reject if file is too big to fit in memory.
       if (isMobile() && msg.size > MAX_MOBILE_BYTES) {
         log("[RX] Too large for mobile browser. Rejecting.");
-        alert("This file is too large to receive on phone browser. Receive on laptop OR use Upload Mode (cloud link).");
-        sendControl({ kind: "reject", reason: "Receiver is mobile; file too large for browser memory." });
+        alert("This file is too large to receive on phone browser. Please use a desktop or upload to cloud.");
+        sendControl({ kind: "reject", reason: "Receiver is mobile; file too large." });
         resetRxHard();
         return;
       }
-
-      log(`[RX] Incoming request: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks). Click "Accept Incoming".`);
+      log(`[RX] Incoming request: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks). Click \"Accept Incoming\" to receive.`);
       return;
     }
-
     return;
   }
-
-  // BINARY chunk packets
-  // IMPORTANT: ignore chunks until receiver ACCEPTS (rxMeta != null)
+  // If we haven't accepted the file yet, ignore binary chunks.
   if (!rxMeta) return;
-
   const { index, payload } = unpackChunk(data);
-
   rxChunkMap.set(index, payload);
   rxReceivedBytes += payload.byteLength;
-
   if (rxExpectedSize > 0) {
     progressEl.value = Math.min(100, Math.floor((rxReceivedBytes / rxExpectedSize) * 100));
   }
-
   rxWriteChain = rxWriteChain.then(() => drainWrites()).catch(() => {});
 }
 
 /* ================================
-   Accept Incoming button (user gesture -> picker allowed)
+   Accept incoming file (requires user gesture)
    ================================ */
 acceptBtn.onclick = async () => {
   if (!pendingMeta) {
     alert("No incoming file request.");
     return;
   }
-
-  // Prepare RX state
+  // Prepare receive state for new file.
   rxMeta = pendingMeta;
   rxTotalChunks = pendingMeta.totalChunks;
   rxExpectedSize = pendingMeta.size;
@@ -254,28 +242,24 @@ acceptBtn.onclick = async () => {
   rxChunkMap.clear();
   rxParts = [];
   progressEl.value = 0;
-
   log(`[RX] Accepted: ${rxMeta.name}. Choose save location...`);
-
-  // IMPORTANT: This is a click handler => user gesture => picker works reliably
+  // Use File System Access API to get a writable stream (desktop only).
   try {
     rxWriter = await openWriterIfPossible(rxMeta.name);
     if (rxWriter) {
       log("[RX] Streaming write enabled.");
     } else {
-      log("[RX] Streaming not available (will buffer in memory). Large files may fail on this browser/device.");
+      log("[RX] Streaming not available; will buffer in memory. Large files may fail.");
     }
   } catch {
     rxWriter = null;
-    log("[RX] Save picker canceled/blocked. Large files will likely fail (RAM buffering).");
-    alert("You canceled the Save dialog. Large files cannot be received safely. Try again and press Save.");
-    // Do not accept transfer if user canceled
+    log("[RX] Save picker canceled or blocked. Aborting transfer.");
+    alert("You canceled the save dialog. Transfer will not proceed.");
+    sendControl({ kind: "reject", reason: "Receiver canceled save dialog." });
     resetRxHard();
-    sendControl({ kind: "reject", reason: "Receiver canceled Save dialog." });
     return;
   }
-
-  // Tell sender OK to start now
+  // Accept the file and tell sender to start sending.
   sendControl({ kind: "accept" });
   pendingMeta = null;
 };
@@ -288,19 +272,15 @@ function cleanup() {
   disconnectBtn.disabled = true;
   sendBtn.disabled = true;
   acceptBtn.disabled = true;
-
   txActive = false;
   txAbort = false;
   if (txWaitAcceptResolve) { txWaitAcceptResolve(); txWaitAcceptResolve = null; }
-
   try { if (ws) ws.close(); } catch {}
   try { if (dcs) dcs.forEach(c => c && c.close()); } catch {}
   try { if (pc) pc.close(); } catch {}
-
   ws = null;
   pc = null;
   dcs = [];
-
   resetRxHard();
   setStatus("Disconnected", false);
 }
@@ -314,15 +294,11 @@ randBtn.onclick = () => {
 connectBtn.onclick = async () => {
   const roomId = roomEl.value.trim();
   if (!roomId) return alert("Enter a Room ID first.");
-
   const wsBase = httpToWsBase(SIGNALING_HTTP);
   const wsUrl = `${wsBase}/ws/${encodeURIComponent(roomId)}`;
-
   setStatus("Connecting...");
   log(`[WS] ${wsUrl}`);
-
   ws = new WebSocket(wsUrl);
-
   ws.onopen = async () => {
     log("[WS] Connected");
     setStatus("Signaling connected", true);
@@ -330,11 +306,9 @@ connectBtn.onclick = async () => {
     disconnectBtn.disabled = false;
     await startPeer();
   };
-
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
     if (!pc) return;
-
     if (msg.type === "offer") {
       log("[SIG] offer");
       await pc.setRemoteDescription(msg.sdp);
@@ -342,22 +316,18 @@ connectBtn.onclick = async () => {
       await pc.setLocalDescription(answer);
       ws.send(JSON.stringify({ type: "answer", sdp: pc.localDescription }));
     }
-
     if (msg.type === "answer") {
       log("[SIG] answer");
       await pc.setRemoteDescription(msg.sdp);
     }
-
     if (msg.type === "ice" && msg.candidate) {
       await pc.addIceCandidate(msg.candidate);
     }
   };
-
   ws.onerror = () => {
     setStatus("WebSocket error", false);
     log("[WS] error");
   };
-
   ws.onclose = () => {
     log("[WS] closed");
     cleanup();
@@ -371,23 +341,20 @@ async function startPeer() {
   pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" }
-      // TURN improves connectivity reliability; speed is limited by upload bandwidth.
+      // To improve connectivity in restrictive networks, add TURN credentials here.
     ],
   });
-
   pc.onicecandidate = (e) => {
     if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "ice", candidate: e.candidate }));
     }
   };
-
   pc.onconnectionstatechange = () => {
     log(`[RTC] state=${pc.connectionState}`);
     if (pc.connectionState === "connected") setStatus("P2P connected", true);
-    if (["failed","disconnected","closed"].includes(pc.connectionState)) setStatus("P2P not connected", false);
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) setStatus("P2P not connected", false);
   };
-
-  // Remote-created channels
+  // When the remote peer creates channels
   pc.ondatachannel = (e) => {
     const ch = e.channel;
     const m = /file-(\d+)/.exec(ch.label || "");
@@ -395,18 +362,15 @@ async function startPeer() {
     setupDataChannel(ch, idx);
     dcs[idx] = ch;
   };
-
-  // Create multiple channels
+  // Create our own channels.
   dcs = [];
   for (let i = 0; i < NUM_CHANNELS; i++) {
     const ch = pc.createDataChannel(`file-${i}`, { ordered: false });
     setupDataChannel(ch, i);
     dcs.push(ch);
   }
-
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-
   ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription }));
   log("[SIG] offer sent");
 }
@@ -414,55 +378,41 @@ async function startPeer() {
 function setupDataChannel(ch, idx) {
   ch.binaryType = "arraybuffer";
   ch.bufferedAmountLowThreshold = LOW_WATER;
-
   ch.onopen = () => {
     log(`[DC${idx}] open`);
-    const allOpen =
-      dcs.length === NUM_CHANNELS &&
-      dcs.every(c => c && c.readyState === "open");
-
+    const allOpen = dcs.length === NUM_CHANNELS && dcs.every(c => c && c.readyState === "open");
     if (allOpen) {
       sendBtn.disabled = false;
       acceptBtn.disabled = false;
       setStatus("P2P connected", true);
     }
   };
-
   ch.onclose = () => {
     log(`[DC${idx}] closed`);
     sendBtn.disabled = true;
     acceptBtn.disabled = true;
   };
-
   ch.onerror = () => {
     log(`[DC${idx}] error`);
     sendBtn.disabled = true;
     acceptBtn.disabled = true;
   };
-
   ch.onmessage = (event) => handleIncoming(event.data);
 }
 
 /* ================================
-   Sending (parallel / round-robin)
-   Waits for receiver "accept"
+   Sending (parallel, round‑robin)
+   Waits for receiver acceptance
    ================================ */
 sendBtn.onclick = async () => {
   const file = fileEl.files[0];
   if (!file) return alert("Select a file first.");
-
-  const ready =
-    dcs.length === NUM_CHANNELS &&
-    dcs.every(c => c && c.readyState === "open");
-
+  const ready = dcs.length === NUM_CHANNELS && dcs.every(c => c && c.readyState === "open");
   if (!ready) return alert("Not connected yet (all channels not open).");
-
   txActive = true;
   txAbort = false;
-
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-
-  // Send meta on channel 0
+  // Send metadata on channel 0.
   const meta = {
     kind: "meta",
     name: file.name,
@@ -472,36 +422,28 @@ sendBtn.onclick = async () => {
     totalChunks
   };
   dcs[0].send(JSON.stringify(meta));
-
   log(`[TX] Request sent. Waiting for receiver accept... (${file.name}, ${file.size} bytes)`);
   progressEl.value = 0;
-
-  // Wait for accept or reject
+  // Wait for receiver acceptance or rejection.
   await new Promise((resolve) => { txWaitAcceptResolve = resolve; });
-
   if (txAbort) {
     log("[TX] Aborted before start.");
     txActive = false;
     return;
   }
-
   let sentBytes = 0;
-
   for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
     if (txAbort) {
       log("[TX] Aborted.");
       txActive = false;
       return;
     }
-
     const offset = chunkIndex * CHUNK_SIZE;
     const slice = file.slice(offset, offset + CHUNK_SIZE);
     const buf = await slice.arrayBuffer();
-
     const chIdx = chunkIndex % NUM_CHANNELS;
     const ch = dcs[chIdx];
-
-    // per-channel backpressure
+    // Wait until the channel's buffer is not full.
     while (ch.bufferedAmount > HIGH_WATER) {
       if (txAbort) break;
       await new Promise((resolve) => {
@@ -512,19 +454,15 @@ sendBtn.onclick = async () => {
         ch.addEventListener("bufferedamountlow", onLow);
       });
     }
-
     if (txAbort) {
       log("[TX] Aborted.");
       txActive = false;
       return;
     }
-
     ch.send(packChunk(chunkIndex, buf));
-
     sentBytes += buf.byteLength;
     progressEl.value = Math.min(100, Math.floor((sentBytes / file.size) * 100));
   }
-
   log("[TX] Done");
   txActive = false;
   await wait(200);
