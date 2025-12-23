@@ -12,6 +12,7 @@ const connectBtn = document.getElementById("connect");
 const disconnectBtn = document.getElementById("disconnect");
 const fileEl = document.getElementById("file");
 const sendBtn = document.getElementById("send");
+const acceptBtn = document.getElementById("accept");
 const progressEl = document.getElementById("progress");
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
@@ -56,14 +57,17 @@ let pc = null;
 let dcs = []; // RTCDataChannel array
 
 /* ================================
-   TX state (so receiver can reject)
+   TX state (wait accept / reject)
    ================================ */
 let txActive = false;
 let txAbort = false;
+let txWaitAcceptResolve = null;
 
 /* ================================
-   RX state
+   RX state (accept flow)
    ================================ */
+let pendingMeta = null;
+
 let rxMeta = null;
 let rxTotalChunks = 0;
 let rxExpectedSize = 0;
@@ -100,7 +104,6 @@ function unpackChunk(packetBuf) {
    Control messages between peers
    ================================ */
 function sendControl(msgObj) {
-  // Send control over channel 0 if possible
   const ch0 = dcs[0];
   if (ch0 && ch0.readyState === "open") {
     ch0.send(JSON.stringify(msgObj));
@@ -119,6 +122,19 @@ async function openWriterIfPossible(fileName) {
     types: [{ description: "All files", accept: { "*/*": [".*"] } }],
   });
   return await handle.createWritable();
+}
+
+function resetRxHard() {
+  pendingMeta = null;
+  rxMeta = null;
+  rxTotalChunks = 0;
+  rxExpectedSize = 0;
+  rxReceivedBytes = 0;
+  rxNextWriteIndex = 0;
+  rxChunkMap.clear();
+  rxWriter = null;
+  rxParts = [];
+  progressEl.value = 0;
 }
 
 async function drainWrites() {
@@ -141,6 +157,7 @@ async function drainWrites() {
       await rxWriter.close();
       log("[RX] File saved (streamed to disk).");
     } else {
+      // WARNING: huge files may crash in browsers that must buffer in RAM.
       const blob = new Blob(rxParts, { type: rxMeta.mime || "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -151,33 +168,15 @@ async function drainWrites() {
       log("[RX] Download triggered (buffered).");
     }
 
-    // reset RX state
-    rxMeta = null;
-    rxTotalChunks = 0;
-    rxExpectedSize = 0;
-    rxReceivedBytes = 0;
-    rxNextWriteIndex = 0;
-    rxChunkMap.clear();
-    rxWriter = null;
-    rxParts = [];
-    progressEl.value = 0;
+    resetRxHard();
   }
 }
 
-function resetRxHard() {
-  rxMeta = null;
-  rxTotalChunks = 0;
-  rxExpectedSize = 0;
-  rxReceivedBytes = 0;
-  rxNextWriteIndex = 0;
-  rxChunkMap.clear();
-  rxWriter = null;
-  rxParts = [];
-  progressEl.value = 0;
-}
-
+/* ================================
+   Incoming handler
+   ================================ */
 function handleIncoming(data) {
-  // STRING = meta/control
+  // STRING = control/meta
   if (typeof data === "string") {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
@@ -186,49 +185,35 @@ function handleIncoming(data) {
     if (msg.kind === "reject") {
       if (txActive) {
         txAbort = true;
+        if (txWaitAcceptResolve) { txWaitAcceptResolve(); txWaitAcceptResolve = null; }
         log(`[TX] Receiver rejected: ${msg.reason || "unknown"}`);
         alert(msg.reason || "Receiver rejected the file.");
       }
       return;
     }
 
-    // Receiver-side: meta
+    // Sender-side: receiver accepted (start transfer)
+    if (msg.kind === "accept") {
+      if (txWaitAcceptResolve) { txWaitAcceptResolve(); txWaitAcceptResolve = null; }
+      log("[TX] Receiver accepted. Starting transfer...");
+      return;
+    }
+
+    // Receiver-side: meta (do NOT open picker here; wait for Accept button)
     if (msg.kind === "meta") {
-      // Hard reset RX for new file
       resetRxHard();
+      pendingMeta = msg;
 
-      // Mobile guard
+      // Mobile guard: reject early
       if (isMobile() && msg.size > MAX_MOBILE_BYTES) {
-        log("[RX] File too large for phone browser. Rejecting.");
+        log("[RX] Too large for mobile browser. Rejecting.");
         alert("This file is too large to receive on phone browser. Receive on laptop OR use Upload Mode (cloud link).");
-
-        // Tell sender to stop immediately
         sendControl({ kind: "reject", reason: "Receiver is mobile; file too large for browser memory." });
-
-        // Keep RX cleared and ignore upcoming binary chunks
         resetRxHard();
         return;
       }
 
-      // Accept meta
-      rxMeta = msg;
-      rxTotalChunks = msg.totalChunks;
-      rxExpectedSize = msg.size;
-
-      log(`[RX] Incoming: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks)`);
-
-      // Try streaming writer (desktop). If unavailable, it will buffer (OK for smallish files only).
-      rxWriteChain = (async () => {
-        try {
-          rxWriter = await openWriterIfPossible(msg.name);
-          if (rxWriter) log("[RX] Streaming write enabled.");
-          else log("[RX] Streaming not available (will buffer in memory).");
-        } catch {
-          rxWriter = null;
-          log("[RX] Save picker blocked/cancelled; will buffer in memory.");
-        }
-      })();
-
+      log(`[RX] Incoming request: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks). Click "Accept Incoming".`);
       return;
     }
 
@@ -236,7 +221,7 @@ function handleIncoming(data) {
   }
 
   // BINARY chunk packets
-  // IMPORTANT: If we haven't accepted a file (rxMeta==null), IGNORE chunks.
+  // IMPORTANT: ignore chunks until receiver ACCEPTS (rxMeta != null)
   if (!rxMeta) return;
 
   const { index, payload } = unpackChunk(data);
@@ -252,15 +237,61 @@ function handleIncoming(data) {
 }
 
 /* ================================
+   Accept Incoming button (user gesture -> picker allowed)
+   ================================ */
+acceptBtn.onclick = async () => {
+  if (!pendingMeta) {
+    alert("No incoming file request.");
+    return;
+  }
+
+  // Prepare RX state
+  rxMeta = pendingMeta;
+  rxTotalChunks = pendingMeta.totalChunks;
+  rxExpectedSize = pendingMeta.size;
+  rxReceivedBytes = 0;
+  rxNextWriteIndex = 0;
+  rxChunkMap.clear();
+  rxParts = [];
+  progressEl.value = 0;
+
+  log(`[RX] Accepted: ${rxMeta.name}. Choose save location...`);
+
+  // IMPORTANT: This is a click handler => user gesture => picker works reliably
+  try {
+    rxWriter = await openWriterIfPossible(rxMeta.name);
+    if (rxWriter) {
+      log("[RX] Streaming write enabled.");
+    } else {
+      log("[RX] Streaming not available (will buffer in memory). Large files may fail on this browser/device.");
+    }
+  } catch {
+    rxWriter = null;
+    log("[RX] Save picker canceled/blocked. Large files will likely fail (RAM buffering).");
+    alert("You canceled the Save dialog. Large files cannot be received safely. Try again and press Save.");
+    // Do not accept transfer if user canceled
+    resetRxHard();
+    sendControl({ kind: "reject", reason: "Receiver canceled Save dialog." });
+    return;
+  }
+
+  // Tell sender OK to start now
+  sendControl({ kind: "accept" });
+  pendingMeta = null;
+};
+
+/* ================================
    Connection lifecycle
    ================================ */
 function cleanup() {
   connectBtn.disabled = false;
   disconnectBtn.disabled = true;
   sendBtn.disabled = true;
+  acceptBtn.disabled = true;
 
   txActive = false;
   txAbort = false;
+  if (txWaitAcceptResolve) { txWaitAcceptResolve(); txWaitAcceptResolve = null; }
 
   try { if (ws) ws.close(); } catch {}
   try { if (dcs) dcs.forEach(c => c && c.close()); } catch {}
@@ -340,7 +371,7 @@ async function startPeer() {
   pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" }
-      // TURN will improve reliability, not speed. Speed is limited by upload bandwidth.
+      // TURN improves connectivity reliability; speed is limited by upload bandwidth.
     ],
   });
 
@@ -392,6 +423,7 @@ function setupDataChannel(ch, idx) {
 
     if (allOpen) {
       sendBtn.disabled = false;
+      acceptBtn.disabled = false;
       setStatus("P2P connected", true);
     }
   };
@@ -399,11 +431,13 @@ function setupDataChannel(ch, idx) {
   ch.onclose = () => {
     log(`[DC${idx}] closed`);
     sendBtn.disabled = true;
+    acceptBtn.disabled = true;
   };
 
   ch.onerror = () => {
     log(`[DC${idx}] error`);
     sendBtn.disabled = true;
+    acceptBtn.disabled = true;
   };
 
   ch.onmessage = (event) => handleIncoming(event.data);
@@ -411,6 +445,7 @@ function setupDataChannel(ch, idx) {
 
 /* ================================
    Sending (parallel / round-robin)
+   Waits for receiver "accept"
    ================================ */
 sendBtn.onclick = async () => {
   const file = fileEl.files[0];
@@ -438,8 +473,17 @@ sendBtn.onclick = async () => {
   };
   dcs[0].send(JSON.stringify(meta));
 
-  log(`[TX] Sending: ${file.name} (${file.size} bytes, ${totalChunks} chunks, ${NUM_CHANNELS} channels)`);
+  log(`[TX] Request sent. Waiting for receiver accept... (${file.name}, ${file.size} bytes)`);
   progressEl.value = 0;
+
+  // Wait for accept or reject
+  await new Promise((resolve) => { txWaitAcceptResolve = resolve; });
+
+  if (txAbort) {
+    log("[TX] Aborted before start.");
+    txActive = false;
+    return;
+  }
 
   let sentBytes = 0;
 
