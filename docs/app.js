@@ -22,6 +22,12 @@ function setStatus(text, ok = false) {
   if (!ok && text.toLowerCase().includes("error")) statusEl.className = "pill bad";
 }
 
+function isMobile() {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
+const MAX_MOBILE_BYTES = 500 * 1024 * 1024; // 500MB (change if you want)
+
 function log(msg) {
   logEl.textContent += msg + "\n";
   logEl.scrollTop = logEl.scrollHeight;
@@ -158,6 +164,18 @@ function handleIncoming(data) {
       rxChunkMap.clear();
       rxParts = [];
       progressEl.value = 0;
+
+      if (isMobile() && msg.size > MAX_MOBILE_BYTES) {
+        log(`[RX] File too large for mobile browser buffering. Use fallback upload mode.`);
+        alert("This file is too large to receive on phone browser. Use Upload Mode (cloud link) or receive on laptop.");
+        // Reset RX so we don't crash
+        rxMeta = null;
+        rxChunkMap.clear();
+        rxParts = [];
+        progressEl.value = 0;
+        return;
+      }
+
 
       log(`[RX] Incoming: ${msg.name} (${msg.size} bytes, ${msg.totalChunks} chunks)`);
 
